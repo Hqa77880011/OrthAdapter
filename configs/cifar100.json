@@ -1,0 +1,39 @@
+{
+  "dataset": "cifar100",
+  "root": "data/raw",
+  "data": "data/prepared",
+  "output": "outputs/main",
+  "checkpoint": "",
+  "device": "auto",
+  "image_size": 224,
+  "backbone": "vit_b_16",
+  "pretrained": true,
+  "adapter_blocks": 6,
+  "rank": 4,
+  "alpha": 8.0,
+  "lambda_orth": 0.05,
+  "stages": 10,
+  "epochs": 20,
+  "batch_size": 32,
+  "lr": 0.001,
+  "weight_decay": 0.01,
+  "variant": "orthadapter",
+  "variants": [
+    "linear",
+    "finetune",
+    "lora",
+    "no_alignment",
+    "orthadapter"
+  ],
+  "seed": 2026,
+  "seeds": [
+    2026,
+    2027,
+    2028
+  ],
+  "val_size": 5000,
+  "limit": 0,
+  "max_steps": 0,
+  "workers": 0,
+  "threads": 4
+}
