@@ -78,6 +78,10 @@ def parse_config(commands):
     parser.add_argument("--set", action="append", default=[], metavar="KEY=JSON")
     args = parser.parse_args()
     config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    config.setdefault("class_order_seed", 2026)
+    config.setdefault("split_seed", 2026)
+    config.setdefault("timing_warmup", 200)
+    config.setdefault("timing_steps", 1000)
     for key, value in vars(args).items():
         if key not in ["command", "config", "set"] and value is not None:
             config[key] = value
@@ -108,7 +112,7 @@ def prepare(config):
     out = Path(config["data"])
     out.mkdir(parents=True, exist_ok=True)
     name = config["dataset"]
-    seed = config.get("seed", 2026)
+    seed = config.get("split_seed", 2026)
     if name in ["cifar10", "cifar100"]:
         cls = datasets.CIFAR10 if name == "cifar10" else datasets.CIFAR100
         train = cls(str(root), train=True, download=True)

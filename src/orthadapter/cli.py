@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import time
 import numpy as np
 import torch
 from torch.nn import functional as F
@@ -17,6 +18,7 @@ from .common import (
     plot_csv,
 )
 from .method import OrthAdapter, VARIANTS
+from .metrics import incremental_metrics, adapter_storage
 
 
 def stage_groups(classes, stages, seed):
@@ -45,7 +47,7 @@ def train(config):
     seed_everything(config["seed"])
     data = Images(config, "train", augment=True)
     test = Images(config, "test")
-    order, groups = stage_groups(len(data.classes), config["stages"], config["seed"])
+    order, groups = stage_groups(len(data.classes), config["stages"], config.get("class_order_seed", 2026))
     remap = torch.tensor(np.argsort(order), dtype=torch.long)
     model = OrthAdapter(config).to(device_of(config))
     history, stage_rows, accuracy_matrix = [], [], []
@@ -92,7 +94,7 @@ def train(config):
             scheduler.step()
             if config["max_steps"] and steps >= config["max_steps"]:
                 break
-        gamma = model.align() if config["variant"] == "orthadapter" else 1.0
+        gamma = model.align() if config["variant"] in ["orthadapter", "alignment"] else 1.0
         seen = [label for group in groups[: stage + 1] for label in group]
         task_accuracy = [
             measure(model, test, group, remap, config) for group in groups[: stage + 1]
@@ -107,6 +109,7 @@ def train(config):
             "old_accuracy": float(np.mean(task_accuracy[:-1])) if stage else None,
             "alignment": gamma,
             "trainable_parameters": sum(p.numel() for p in parameters),
+            "adapter_bytes": adapter_storage(model),
             "adapter_parameters": sum(
                 p.numel()
                 for layer in model.adapted_layers()
@@ -126,18 +129,12 @@ def train(config):
             },
             output / f"stage_{stage + 1}.pt",
         )
-    forgetting = [
-        max(accuracy_matrix[t][j] for t in range(j, len(groups) - 1))
-        - accuracy_matrix[-1][j]
-        for j in range(len(groups) - 1)
-    ]
     summary = {
         "variant": config["variant"],
         "seed": config["seed"],
-        "average_accuracy": float(np.mean([r["accuracy"] for r in stage_rows])),
-        "final_accuracy": stage_rows[-1]["accuracy"],
-        "forgetting": float(np.mean(forgetting)) if forgetting else 0.0,
+        **incremental_metrics(accuracy_matrix, [r["accuracy"] for r in stage_rows]),
         "adapter_parameters": stage_rows[-1]["adapter_parameters"],
+        "adapter_bytes": adapter_storage(model),
     }
     save_rows(output / "history.csv", history)
     save_rows(output / "stages.csv", stage_rows)
@@ -155,13 +152,19 @@ def train(config):
     return summary
 
 
-def evaluate(config):
+def load_checkpoint(config):
+    """Reconstruct cumulative stage modules before loading a saved state."""
     state = torch.load(config["checkpoint"], map_location="cpu", weights_only=False)
     trained = dict(state["config"], pretrained=False)
     model = OrthAdapter(trained).to(device_of(config))
     for group in state["groups"]:
         model.add_stage(len(group))
     model.load_state_dict(state["model"])
+    return model, state
+
+
+def evaluate(config):
+    model, state = load_checkpoint(config)
     remap = torch.tensor(np.argsort(state["order"]), dtype=torch.long)
     data = Images(config, "test")
     rows = [
@@ -170,6 +173,43 @@ def evaluate(config):
     ]
     save_rows(Path(config["output"]) / "evaluation.csv", rows)
     print(json.dumps(rows), flush=True)
+
+
+def profile(config):
+    """Measure matched current-stage training steps, excluding stage-end alignment."""
+    rows = []
+    for weight in [0., config["lambda_orth"]]:
+        model, state = load_checkpoint(config)
+        data = Images(config, "train", augment=False)
+        current = Subset(data, np.flatnonzero(np.isin(data.labels, state["groups"][-1])).tolist())
+        x, labels = next(iter(loader(current, config)))
+        x = x.to(device_of(config))
+        y = torch.tensor(np.argsort(state["order"]), dtype=torch.long)[labels].to(x.device)
+        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=config["lr"], weight_decay=config["weight_decay"])
+        model.train()
+        timings = []
+        for i in range(config.get("timing_warmup", 200) + config.get("timing_steps", 1000)):
+            if x.is_cuda:
+                torch.cuda.synchronize()
+                if i == config.get("timing_warmup", 200):
+                    torch.cuda.reset_peak_memory_stats()
+            start = time.perf_counter()
+            optimizer.zero_grad(set_to_none=True)
+            loss = F.cross_entropy(model(x)[0], y)
+            if weight:
+                loss = loss + weight * model.orthogonality()
+            loss.backward()
+            optimizer.step()
+            if x.is_cuda:
+                torch.cuda.synchronize()
+            if i >= config.get("timing_warmup", 200):
+                timings.append((time.perf_counter() - start) * 1000)
+        rows.append({"stage": len(state["groups"]), "lambda_orth": weight,
+                     "batch_size": len(x), "step_ms": float(np.mean(timings)),
+                     "adapter_bytes": adapter_storage(model),
+                     "peak_cuda_bytes": torch.cuda.max_memory_allocated() if x.is_cuda else None})
+    save_rows(Path(config["output"]) / "profile.csv", rows)
+    return rows
 
 
 def compare(config):
@@ -187,7 +227,7 @@ def compare(config):
 
 
 def main():
-    command, config = parse_config(["prepare", "train", "evaluate", "compare", "plot"])
+    command, config = parse_config(["prepare", "train", "evaluate", "compare", "profile", "plot"])
     if command == "prepare":
         prepare(config)
     elif command == "train":
@@ -196,6 +236,8 @@ def main():
         evaluate(config)
     elif command == "compare":
         compare(config)
+    elif command == "profile":
+        profile(config)
     else:
         root = Path(config["output"])
         if (root / "stages.csv").exists():

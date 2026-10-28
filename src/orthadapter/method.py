@@ -5,7 +5,7 @@ from torch.nn import functional as F
 from torchvision import models
 from torchvision.models.vision_transformer import VisionTransformer
 
-VARIANTS = ["orthadapter", "lora", "no_alignment", "linear", "finetune"]
+VARIANTS = ["orthadapter", "lora", "alignment", "no_alignment", "linear", "finetune"]
 
 
 class Factors(nn.Module):
@@ -121,7 +121,7 @@ class OrthAdapter(nn.Module):
             raise ValueError("backbone must be vit_b_16 or small")
         self.backbone.heads = nn.Identity()
         self.classifiers = nn.ModuleList()
-        if config["variant"] in ["orthadapter", "lora", "no_alignment"]:
+        if config["variant"] in ["orthadapter", "lora", "alignment", "no_alignment"]:
             blocks = list(self.backbone.encoder.layers)
             for block in blocks[-config["adapter_blocks"] :]:
                 block.self_attention = CumulativeAttention(
@@ -138,6 +138,8 @@ class OrthAdapter(nn.Module):
 
     def add_stage(self, classes):
         self.requires_grad_(False)
+        for parameter in self.parameters():
+            parameter.grad = None
         for layer in self.adapted_layers():
             layer.add_stage()
         if self.config["variant"] == "finetune":
